@@ -1,5 +1,6 @@
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
+from psycopg2.extensions import lobject
 from typing import Optional, Tuple, BinaryIO, Union
 import hashlib
 from datetime import datetime
@@ -20,6 +21,7 @@ class ClientConfig:
     http_client: Optional[urllib3.PoolManager] = None
     min_connections: int = 1
     max_connections: int = 10
+    chunk_size: int = 8192  # Size of chunks when reading/writing files
 
 class PostgresStorageClient:
     def __init__(
@@ -44,6 +46,7 @@ class PostgresStorageClient:
         :param http_client: Optional HTTP client for connection pooling
         :param min_connections: Minimum number of connections in pool
         :param max_connections: Maximum number of connections in pool
+        Uses LARGE OBJECTS for file storage (up to 4TB per file).
         """
         self.config = self._parse_endpoint(endpoint)
         self.config.user = access_key
@@ -132,7 +135,7 @@ class PostgresStorageClient:
                     CREATE TABLE IF NOT EXISTS storage_objects (
                         bucket_name VARCHAR REFERENCES storage_buckets(bucket_name),
                         object_name VARCHAR,
-                        data BYTEA NOT NULL,
+                        loid OID NOT NULL,  -- Large Object ID
                         size BIGINT NOT NULL,
                         etag VARCHAR,
                         content_type VARCHAR,
@@ -144,7 +147,7 @@ class PostgresStorageClient:
                 conn.commit()
         finally:
             self._put_conn(conn)
-    
+            
     def make_bucket(self, bucket_name: str, location: Optional[str] = None) -> None:
         """
         Create a new bucket.
@@ -200,47 +203,65 @@ class PostgresStorageClient:
         content_type: Optional[str] = None,
         metadata: Optional[dict] = None
     ) -> dict:
-        """Upload a file to a bucket."""
+        """
+        Upload a file to a bucket using LARGE OBJECTS.
+        Supports files up to 4TB in size.
+        """
         if not self.bucket_exists(bucket_name):
             raise ValueError(f"Bucket '{bucket_name}' does not exist")
+        
+        file_size = os.path.getsize(file_path)
+        md5_hash = hashlib.md5()
+        
+        conn = self._get_conn()
+        try:
+            # Create a new large object
+            lobj = conn.lobject(mode='wb')
+            loid = lobj.oid
             
-        with open(file_path, 'rb') as f:
-            data = f.read()
-            etag = hashlib.md5(data).hexdigest()
+            # Read and write file in chunks to calculate MD5 and save to large object
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(self.config.chunk_size)
+                    if not chunk:
+                        break
+                    md5_hash.update(chunk)
+                    lobj.write(chunk)
             
-            conn = self._get_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO storage_objects 
-                        (bucket_name, object_name, data, size, etag, content_type, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (bucket_name, object_name) DO UPDATE
-                        SET data = EXCLUDED.data,
-                            size = EXCLUDED.size,
-                            etag = EXCLUDED.etag,
-                            content_type = EXCLUDED.content_type,
-                            metadata = EXCLUDED.metadata
-                        """,
-                        (
-                            bucket_name,
-                            object_name,
-                            psycopg2.Binary(data),
-                            len(data),
-                            etag,
-                            content_type or 'application/octet-stream',
-                            json.dumps(metadata) if metadata else None
-                        )
+            etag = md5_hash.hexdigest()
+            
+            # Save the reference in our objects table
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO storage_objects 
+                    (bucket_name, object_name, loid, size, etag, content_type, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (bucket_name, object_name) DO UPDATE
+                    SET loid = EXCLUDED.loid,
+                        size = EXCLUDED.size,
+                        etag = EXCLUDED.etag,
+                        content_type = EXCLUDED.content_type,
+                        metadata = EXCLUDED.metadata
+                    """,
+                    (
+                        bucket_name,
+                        object_name,
+                        loid,
+                        file_size,
+                        etag,
+                        content_type or 'application/octet-stream',
+                        json.dumps(metadata) if metadata else None
                     )
-                    conn.commit()
-            finally:
-                self._put_conn(conn)
+                )
+                conn.commit()
             
             return {
                 "etag": etag,
                 "version_id": None
             }
+        finally:
+            self._put_conn(conn)
     
     def fget_object(
         self,
@@ -248,13 +269,13 @@ class PostgresStorageClient:
         object_name: str,
         file_path: str
     ) -> dict:
-        """Download an object to a file."""
+        """Download an object from a bucket using LARGE OBJECTS."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT data, etag, content_type, metadata
+                    SELECT loid, etag, content_type, metadata
                     FROM storage_objects
                     WHERE bucket_name = %s AND object_name = %s
                     """,
@@ -265,10 +286,18 @@ class PostgresStorageClient:
                 if result is None:
                     raise ValueError(f"Object '{object_name}' not found in bucket '{bucket_name}'")
                 
-                data, etag, content_type, metadata = result
+                loid, etag, content_type, metadata = result
                 
+                # Open the large object for reading
+                lobj = conn.lobject(oid=loid, mode='rb')
+                
+                # Write to file in chunks
                 with open(file_path, 'wb') as f:
-                    f.write(data)
+                    while True:
+                        chunk = lobj.read(self.config.chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
                 
                 return {
                     "etag": etag,
@@ -280,21 +309,38 @@ class PostgresStorageClient:
             self._put_conn(conn)
     
     def remove_object(self, bucket_name: str, object_name: str) -> None:
-        """Remove an object from a bucket."""
+        """Remove an object and its associated large object from a bucket."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
+                # First get the large object ID
                 cur.execute(
                     """
-                    DELETE FROM storage_objects
+                    SELECT loid FROM storage_objects
                     WHERE bucket_name = %s AND object_name = %s
                     """,
                     (bucket_name, object_name)
                 )
-                conn.commit()
+                result = cur.fetchone()
+                
+                if result:
+                    loid = result[0]
+                    # Delete the large object
+                    lobj = conn.lobject(oid=loid)
+                    lobj.unlink()
+                    
+                    # Delete the reference
+                    cur.execute(
+                        """
+                        DELETE FROM storage_objects
+                        WHERE bucket_name = %s AND object_name = %s
+                        """,
+                        (bucket_name, object_name)
+                    )
+                    conn.commit()
         finally:
             self._put_conn(conn)
-    
+
     def list_objects(
         self,
         bucket_name: str,

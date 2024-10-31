@@ -6,8 +6,8 @@ import os
 load_dotenv()
 
 # Now you can access the variables
-ACCESS_KEY = os.getenv("ACCESS_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY")
+ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+SECRET_KEY = os.getenv("S3_SECRET_KEY")
 POSTGRES_SERVER = os.getenv("POSTGRES_SERVER")
 
 # Create client with username/password
@@ -25,14 +25,14 @@ client.make_bucket("test-bucket")
 # Upload a file
 client.fput_object(
     "test-bucket",
-    "test-file.txt",
-    "testfile.txt",
+    "Meta-Llama-3-8B-Instruct.Q8_0.gguf",
+    "Meta-Llama-3-8B-Instruct.Q8_0.gguf",
     content_type="text/plain"
 )
 
 # Download a file
 client.fget_object(
     "test-bucket",
-    "test-file.txt",
-    "downloaded-file.txt"
+    "Meta-Llama-3-8B-Instruct.Q8_0.gguf",
+    "downloaded.gguf"
 )
