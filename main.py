@@ -1,4 +1,4 @@
-from postgres import PostgresStorageClient
+from postgreS3 import PostgresStorageClient
 from dotenv import load_dotenv
 import os
 
